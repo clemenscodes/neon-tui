@@ -64,10 +64,16 @@ pub struct BranchInfo {
 }
 
 #[derive(Debug, Clone)]
+pub struct TimelineInfo {
+    pub id: String,
+    pub branch_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct TenantInfo {
     pub id: String,
     pub is_default: bool,
-    pub timelines: usize,
+    pub timelines: Vec<TimelineInfo>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -156,7 +162,7 @@ fn read_docker_state(config: &Config) -> NeonState {
 /// Fetch tenants from the pageserver HTTP API in Docker mode.
 ///
 /// Queries `GET /v1/tenant` and then `GET /v1/tenant/{id}/timeline` for each tenant
-/// to obtain the timeline count.  Returns an empty Vec on any network / parse error.
+/// to obtain the timeline list with branch names.  Returns an empty Vec on any network / parse error.
 fn build_docker_tenants(config: &Config) -> Vec<TenantInfo> {
     #[derive(Deserialize)]
     struct TenantEntry {
@@ -165,7 +171,8 @@ fn build_docker_tenants(config: &Config) -> Vec<TenantInfo> {
 
     #[derive(Deserialize)]
     struct TimelineEntry {
-        // We only need the list length; no fields required.
+        timeline_id: String,
+        ancestor_timeline_id: Option<String>,
     }
 
     let base = format!("http://127.0.0.1:{}/v1", config.ports.pageserver_http);
@@ -184,20 +191,45 @@ fn build_docker_tenants(config: &Config) -> Vec<TenantInfo> {
     // There is typically one default tenant; treat the first as default.
     let first_id = tenant_list.first().map(|t| t.id.clone());
 
+    // Build timeline_id → branch_name map from the docker branch state file.
+    let branch_state = docker::read_docker_branch_state();
+    let mut timeline_to_branch: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for (branch_name, entry) in &branch_state.branches {
+        timeline_to_branch.insert(entry.timeline_id.clone(), branch_name.clone());
+    }
+
     tenant_list
         .into_iter()
         .map(|t| {
-            let timelines: Vec<TimelineEntry> =
+            let timeline_entries: Vec<TimelineEntry> =
                 ureq::get(&format!("{base}/tenant/{}/timeline", t.id))
                     .call()
                     .ok()
                     .and_then(|r| r.into_string().ok())
                     .and_then(|s| serde_json::from_str(&s).ok())
                     .unwrap_or_default();
+
+            let timelines = timeline_entries
+                .into_iter()
+                .map(|tl| {
+                    // The root timeline (no ancestor) maps to the default branch name.
+                    let branch_name = if tl.ancestor_timeline_id.is_none() {
+                        Some(config.compute.default_branch.clone())
+                    } else {
+                        timeline_to_branch.get(&tl.timeline_id).cloned()
+                    };
+                    TimelineInfo {
+                        id: tl.timeline_id,
+                        branch_name,
+                    }
+                })
+                .collect();
+
             TenantInfo {
                 is_default: first_id.as_deref() == Some(&t.id),
                 id: t.id,
-                timelines: timelines.len(),
+                timelines,
             }
         })
         .collect()
@@ -227,13 +259,20 @@ fn build_docker_components(
                 _ => Status::Down,
             };
             let docker_container = container.map(|c| c.name.clone());
+            let start_time = if status == Status::Up {
+                docker_container
+                    .as_deref()
+                    .and_then(docker::container_started_at)
+            } else {
+                None
+            };
             ComponentInfo {
                 name: display.to_string(),
                 status,
                 pid: None,
                 port: *port,
                 log_file: None,
-                start_time: None,
+                start_time,
                 docker_container,
             }
         })
@@ -555,9 +594,9 @@ fn read_tenants(config: &Config) -> Vec<TenantInfo> {
         .and_then(|l| l.split('=').nth(1))
         .map(|v| v.trim().trim_matches('"').to_string());
 
-    // Parse branch_name_mappings to count timelines per tenant
+    // Parse branch_name_mappings to extract timelines per tenant with branch names.
     // Format: branch_name = [["tenant_id", "timeline_id"]]
-    let mut tenant_timelines: std::collections::HashMap<String, usize> =
+    let mut tenant_timelines: std::collections::HashMap<String, Vec<TimelineInfo>> =
         std::collections::HashMap::new();
     let mut in_mappings = false;
     for line in contents.lines() {
@@ -570,12 +609,40 @@ fn read_tenants(config: &Config) -> Vec<TenantInfo> {
             break;
         }
         if in_mappings && trimmed.contains('=') {
-            // Extract tenant_id from [["tenant_id", "timeline_id"]]
+            // Parse branch_name from left side of '='
+            let branch_name = trimmed
+                .split('=')
+                .next()
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            // Extract tenant_id and timeline_id from [["tenant_id", "timeline_id"]]
             if let Some(start) = trimmed.find("[[\"") {
                 let rest = &trimmed[start + 3..];
+                // First string: tenant_id
                 if let Some(end) = rest.find('"') {
-                    let tenant_id = &rest[..end];
-                    *tenant_timelines.entry(tenant_id.to_string()).or_insert(0) += 1;
+                    let tenant_id = rest[..end].to_string();
+                    // Second string: after the first closing quote, skip separator, find next quoted string
+                    let after_tenant = &rest[end + 1..];
+                    let timeline_id = after_tenant
+                        .find('"')
+                        .and_then(|s| {
+                            let inner = &after_tenant[s + 1..];
+                            inner.find('"').map(|e| inner[..e].to_string())
+                        })
+                        .unwrap_or_default();
+
+                    if !timeline_id.is_empty() {
+                        tenant_timelines
+                            .entry(tenant_id)
+                            .or_default()
+                            .push(TimelineInfo {
+                                id: timeline_id,
+                                branch_name: Some(branch_name),
+                            });
+                    } else {
+                        // timeline_id not parseable; still record tenant
+                        tenant_timelines.entry(tenant_id).or_default();
+                    }
                 }
             }
         }
@@ -583,7 +650,7 @@ fn read_tenants(config: &Config) -> Vec<TenantInfo> {
 
     // If we found a default tenant but no mappings, still show it
     if let Some(ref dt) = default_tenant {
-        tenant_timelines.entry(dt.clone()).or_insert(0);
+        tenant_timelines.entry(dt.clone()).or_default();
     }
 
     let mut tenants: Vec<TenantInfo> = tenant_timelines

@@ -117,6 +117,71 @@ pub fn list_containers(project: &str) -> Vec<DockerPs> {
     }
 }
 
+/// Get the start time of a Docker container by running `docker inspect`.
+pub fn container_started_at(container_name: &str) -> Option<std::time::SystemTime> {
+    let output = std::process::Command::new("docker")
+        .args(["inspect", "--format", "{{.State.StartedAt}}", container_name])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&output.stdout);
+    let s = s.trim();
+    // Parse RFC3339 format like "2026-03-12T10:15:30.123456789Z"
+    parse_rfc3339_to_system_time(s)
+}
+
+fn parse_rfc3339_to_system_time(s: &str) -> Option<std::time::SystemTime> {
+    // Format: "2026-03-12T10:15:30.123456789Z"
+    let (date_part, time_part) = s.split_once('T')?;
+    let date_parts: Vec<&str> = date_part.split('-').collect();
+    if date_parts.len() < 3 {
+        return None;
+    }
+    let year: u64 = date_parts[0].parse().ok()?;
+    let month: u64 = date_parts[1].parse().ok()?;
+    let day: u64 = date_parts[2].parse().ok()?;
+
+    // Strip nanoseconds and timezone suffix
+    let time_clean = time_part.split('.').next().unwrap_or(time_part);
+    let time_clean = time_clean.trim_end_matches('Z');
+    let time_parts: Vec<&str> = time_clean.split(':').collect();
+    if time_parts.len() < 3 {
+        return None;
+    }
+    let hour: u64 = time_parts[0].parse().ok()?;
+    let min: u64 = time_parts[1].parse().ok()?;
+    let sec: u64 = time_parts[2].parse().ok()?;
+
+    // Days since Unix epoch (1970-01-01)
+    let days = days_since_epoch(year, month, day)?;
+    let secs = days * 86400 + hour * 3600 + min * 60 + sec;
+    Some(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+}
+
+fn days_since_epoch(year: u64, month: u64, day: u64) -> Option<u64> {
+    // Simplified: count days from 1970-01-01
+    let mut days: u64 = 0;
+    for y in 1970..year {
+        days += if is_leap(y) { 366 } else { 365 };
+    }
+    let months = [31u64, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    for m in 1..month {
+        let idx = (m - 1) as usize;
+        days += months[idx];
+        if m == 2 && is_leap(year) {
+            days += 1;
+        }
+    }
+    days += day - 1;
+    Some(days)
+}
+
+fn is_leap(year: u64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
 /// Fetch the last `tail` log lines for a container (stdout + stderr combined).
 ///
 /// Docker writes application logs to stdout/stderr; `docker logs` merges them.

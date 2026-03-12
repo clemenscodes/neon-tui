@@ -48,10 +48,22 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 .map(|d| format_duration(d.as_secs()))
                 .unwrap_or_else(|| "-".to_string());
 
-            let pid = comp
-                .pid
-                .map(|p| p.to_string())
-                .unwrap_or_else(|| "-".to_string());
+            let pid = if app.config.docker.mode {
+                comp.docker_container
+                    .as_deref()
+                    .map(|name| {
+                        if name.len() > 12 {
+                            name[..12].to_string()
+                        } else {
+                            name.to_string()
+                        }
+                    })
+                    .unwrap_or_else(|| "-".to_string())
+            } else {
+                comp.pid
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            };
 
             let row = Row::new(vec![
                 Cell::from(comp.name.clone()),

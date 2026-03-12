@@ -67,10 +67,24 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             };
 
             let url = command::connection_url(&app.config, &branch.name);
-            let pid = branch
-                .pid
-                .map(|p| p.to_string())
-                .unwrap_or_else(|| "-".to_string());
+            let pid = if app.config.docker.mode {
+                branch
+                    .docker_container
+                    .as_deref()
+                    .map(|name| {
+                        if name.len() > 12 {
+                            name[..12].to_string()
+                        } else {
+                            name.to_string()
+                        }
+                    })
+                    .unwrap_or_else(|| "-".to_string())
+            } else {
+                branch
+                    .pid
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            };
 
             let row = Row::new(vec![
                 Cell::from(name),

@@ -224,7 +224,7 @@ impl App {
         match self.panel {
             Panel::Components => self.state.components.len(),
             Panel::Branches => self.state.branches.len(),
-            Panel::Tenants => self.state.tenants.len(),
+            Panel::Tenants => self.state.tenants.iter().map(|t| 1 + t.timelines.len()).sum(),
         }
     }
 
