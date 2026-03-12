@@ -545,10 +545,10 @@ impl App {
         }
     }
 
-    /// Returns `(tenant_id, timeline_id, is_root)` for the currently selected timeline
-    /// sub-row in the Tenants panel, or `None` if the selected row is a tenant header row
-    /// or a different panel is active.
-    pub fn selected_tenant_timeline(&self) -> Option<(String, String, bool)> {
+    /// Returns `(tenant_id, timeline_id, is_root, branch_name)` for the currently selected
+    /// timeline sub-row in the Tenants panel, or `None` if the selected row is a tenant header
+    /// row or a different panel is active.
+    pub fn selected_tenant_timeline(&self) -> Option<(String, String, bool, Option<String>)> {
         if self.panel != Panel::Tenants {
             return None;
         }
@@ -560,7 +560,12 @@ impl App {
             flat += 1;
             for tl in &tenant.timelines {
                 if flat == self.selected_index {
-                    return Some((tenant.id.clone(), tl.id.clone(), tl.is_root));
+                    return Some((
+                        tenant.id.clone(),
+                        tl.id.clone(),
+                        tl.is_root,
+                        tl.branch_name.clone(),
+                    ));
                 }
                 flat += 1;
             }
@@ -585,16 +590,21 @@ impl App {
         } else if self.panel == Panel::Tenants {
             match self.selected_tenant_timeline() {
                 None => {
-                    self.set_status("Select a non-root timeline sub-row to delete.");
+                    self.set_status("Select a timeline sub-row to delete.");
                 }
-                Some((_, _, true)) => {
-                    self.set_status("Select a non-root timeline sub-row to delete.");
+                Some((_, _, true, _)) => {
+                    self.set_status("Cannot delete the root timeline.");
                 }
-                Some((tenant_id, timeline_id, false)) => {
+                Some((_, _, false, Some(branch_name))) => {
+                    self.set_status(format!(
+                        "Delete branch '{branch_name}' first before removing its timeline."
+                    ));
+                }
+                Some((tenant_id, timeline_id, false, None)) => {
                     let short_id = timeline_id.chars().take(12).collect::<String>();
                     self.pending_confirm = Some(PendingConfirm {
                         message: format!(
-                            "Delete timeline {short_id}...? This removes pageserver data."
+                            "Delete dangling timeline {short_id}...? This removes pageserver data."
                         ),
                         action: Box::new(ConfirmAction::DeleteTimeline(tenant_id, timeline_id)),
                     });
