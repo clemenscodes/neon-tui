@@ -9,6 +9,15 @@ pub struct Config {
     pub compute: ComputeConfig,
     pub ports: PortsConfig,
     pub ui: UiConfig,
+    pub docker: DockerConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct DockerConfig {
+    /// When true, detect component status via `docker compose ps` instead of PID files.
+    pub mode: bool,
+    /// Docker Compose project name (defaults to the directory name).
+    pub compose_project: String,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +58,7 @@ struct FileConfig {
     compute: Option<FileCompute>,
     ports: Option<FilePorts>,
     ui: Option<FileUi>,
+    docker: Option<FileDocker>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -83,6 +93,12 @@ struct FileUi {
     show_logs: Option<bool>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct FileDocker {
+    mode: Option<bool>,
+    compose_project: Option<String>,
+}
+
 /// CLI overrides passed from clap
 #[derive(Debug, Default)]
 pub struct CliOverrides {
@@ -91,6 +107,21 @@ pub struct CliOverrides {
     pub bin_dir: Option<PathBuf>,
     pub host: Option<String>,
     pub port: Option<u16>,
+    // docker
+    pub docker_mode: Option<bool>,
+    pub docker_project: Option<String>,
+    // ports
+    pub pageserver_port: Option<u16>,
+    pub safekeeper_port: Option<u16>,
+    pub broker_port: Option<u16>,
+    // compute
+    pub user: Option<String>,
+    pub database: Option<String>,
+    pub default_branch: Option<String>,
+    pub pg_version: Option<u16>,
+    // ui
+    pub refresh_interval: Option<u64>,
+    pub show_logs: Option<bool>,
 }
 
 impl Config {
@@ -102,6 +133,7 @@ impl Config {
         let file_compute = file_cfg.compute.unwrap_or_default();
         let file_ports = file_cfg.ports.unwrap_or_default();
         let file_ui = file_cfg.ui.unwrap_or_default();
+        let file_docker = file_cfg.docker.unwrap_or_default();
 
         Config {
             neon: NeonConfig {
@@ -129,30 +161,44 @@ impl Config {
                     .or_else(|| env_u16("COMPUTE_PORT"))
                     .or(file_compute.port)
                     .unwrap_or(55432),
-                user: env::var("COMPUTE_USER")
-                    .ok()
+                user: cli
+                    .user
+                    .clone()
+                    .or_else(|| env::var("COMPUTE_USER").ok())
                     .or(file_compute.user)
                     .unwrap_or_else(|| "test".to_string()),
-                database: env::var("COMPUTE_DB")
-                    .ok()
+                database: cli
+                    .database
+                    .clone()
+                    .or_else(|| env::var("COMPUTE_DB").ok())
                     .or(file_compute.database)
                     .unwrap_or_else(|| "neondb".to_string()),
-                default_branch: env::var("DEFAULT_BRANCH")
-                    .ok()
+                default_branch: cli
+                    .default_branch
+                    .clone()
+                    .or_else(|| env::var("DEFAULT_BRANCH").ok())
                     .or(file_compute.default_branch)
                     .unwrap_or_else(|| "main".to_string()),
-                pg_version: env_u16("PG_VERSION")
+                pg_version: cli
+                    .pg_version
+                    .or_else(|| env_u16("PG_VERSION"))
                     .or(file_compute.pg_version)
                     .unwrap_or(17),
             },
             ports: PortsConfig {
-                pageserver_http: env_u16("PAGESERVER_HTTP_PORT")
+                pageserver_http: cli
+                    .pageserver_port
+                    .or_else(|| env_u16("PAGESERVER_HTTP_PORT"))
                     .or(file_ports.pageserver_http)
                     .unwrap_or(9898),
-                safekeeper_pg: env_u16("SAFEKEEPER_PG_PORT")
+                safekeeper_pg: cli
+                    .safekeeper_port
+                    .or_else(|| env_u16("SAFEKEEPER_PG_PORT"))
                     .or(file_ports.safekeeper_pg)
                     .unwrap_or(5454),
-                storage_broker: env_u16("STORAGE_BROKER_PORT")
+                storage_broker: cli
+                    .broker_port
+                    .or_else(|| env_u16("STORAGE_BROKER_PORT"))
                     .or(file_ports.storage_broker)
                     .unwrap_or(50051),
                 storage_controller: env_u16("STORAGE_CONTROLLER_PORT")
@@ -166,8 +212,28 @@ impl Config {
                     .unwrap_or(9993),
             },
             ui: UiConfig {
-                refresh_interval_secs: file_ui.refresh_interval.unwrap_or(2),
-                show_logs: file_ui.show_logs.unwrap_or(false),
+                refresh_interval_secs: cli
+                    .refresh_interval
+                    .or(file_ui.refresh_interval)
+                    .unwrap_or(2),
+                show_logs: cli.show_logs.or(file_ui.show_logs).unwrap_or(false),
+            },
+            docker: DockerConfig {
+                mode: cli
+                    .docker_mode
+                    .or_else(|| {
+                        env::var("NEON_DOCKER_MODE")
+                            .ok()
+                            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    })
+                    .or(file_docker.mode)
+                    .unwrap_or(false),
+                compose_project: cli
+                    .docker_project
+                    .clone()
+                    .or_else(|| env::var("NEON_DOCKER_PROJECT").ok())
+                    .or(file_docker.compose_project)
+                    .unwrap_or_else(detect_compose_project),
             },
         }
     }
@@ -202,6 +268,17 @@ impl Config {
 
 fn env_u16(key: &str) -> Option<u16> {
     env::var(key).ok().and_then(|v| v.parse().ok())
+}
+
+/// Infer the Docker Compose project name from the current working directory.
+fn detect_compose_project() -> String {
+    std::env::current_dir()
+        .ok()
+        .and_then(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().to_lowercase().replace('-', "").replace('_', ""))
+        })
+        .unwrap_or_else(|| "neon".to_string())
 }
 
 fn load_config_file(explicit_path: Option<&Path>) -> FileConfig {
@@ -289,5 +366,55 @@ mod tests {
     fn show_logs_defaults_to_false() {
         let cfg = Config::load(&CliOverrides::default());
         assert!(!cfg.ui.show_logs);
+    }
+
+    #[test]
+    fn docker_config_fields_accessible() {
+        // Verify DockerConfig fields compile and have the expected types.
+        let cfg = Config::load(&CliOverrides::default());
+        let _mode: bool = cfg.docker.mode;
+        let _project: &str = &cfg.docker.compose_project;
+    }
+
+    #[test]
+    fn cli_overrides_docker_mode_and_project() {
+        let cli = CliOverrides {
+            docker_mode: Some(true),
+            docker_project: Some("eliteonlineshop".to_string()),
+            ..Default::default()
+        };
+        let cfg = Config::load(&cli);
+        assert!(cfg.docker.mode);
+        assert_eq!(cfg.docker.compose_project, "eliteonlineshop");
+    }
+
+    #[test]
+    fn cli_overrides_all_new_fields() {
+        let cli = CliOverrides {
+            docker_mode: Some(true),
+            docker_project: Some("myproject".to_string()),
+            pageserver_port: Some(9999),
+            safekeeper_port: Some(5555),
+            broker_port: Some(50052),
+            user: Some("alice".to_string()),
+            database: Some("mydb".to_string()),
+            default_branch: Some("dev".to_string()),
+            pg_version: Some(16),
+            refresh_interval: Some(5),
+            show_logs: Some(true),
+            ..Default::default()
+        };
+        let cfg = Config::load(&cli);
+        assert!(cfg.docker.mode);
+        assert_eq!(cfg.docker.compose_project, "myproject");
+        assert_eq!(cfg.ports.pageserver_http, 9999);
+        assert_eq!(cfg.ports.safekeeper_pg, 5555);
+        assert_eq!(cfg.ports.storage_broker, 50052);
+        assert_eq!(cfg.compute.user, "alice");
+        assert_eq!(cfg.compute.database, "mydb");
+        assert_eq!(cfg.compute.default_branch, "dev");
+        assert_eq!(cfg.compute.pg_version, 16);
+        assert_eq!(cfg.ui.refresh_interval_secs, 5);
+        assert!(cfg.ui.show_logs);
     }
 }
