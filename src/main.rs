@@ -45,6 +45,50 @@ struct Cli {
     #[arg(long, global = true)]
     host: Option<String>,
 
+    /// Enable Docker Compose detection mode (e.g. when Neon runs in docker compose)
+    #[arg(long, global = true)]
+    docker: bool,
+
+    /// Docker Compose project name (default: auto-detected from cwd)
+    #[arg(long, global = true)]
+    docker_project: Option<String>,
+
+    /// Pageserver HTTP port (default: 9898)
+    #[arg(long, global = true)]
+    pageserver_port: Option<u16>,
+
+    /// Safekeeper PG port (default: 5454)
+    #[arg(long, global = true)]
+    safekeeper_port: Option<u16>,
+
+    /// Storage broker port (default: 50051)
+    #[arg(long, global = true)]
+    broker_port: Option<u16>,
+
+    /// Compute database user (default: test)
+    #[arg(long, global = true)]
+    user: Option<String>,
+
+    /// Compute database name (default: neondb)
+    #[arg(long, global = true)]
+    database: Option<String>,
+
+    /// Default branch / endpoint name (default: main)
+    #[arg(long, global = true)]
+    branch: Option<String>,
+
+    /// PostgreSQL version (default: 17)
+    #[arg(long, global = true)]
+    pg_version: Option<u16>,
+
+    /// TUI refresh interval in seconds (default: 2)
+    #[arg(long, global = true)]
+    refresh: Option<u64>,
+
+    /// Start directly in log view
+    #[arg(long, global = true)]
+    show_logs: bool,
+
     #[command(subcommand)]
     command: Option<SubCmd>,
 }
@@ -105,6 +149,17 @@ async fn main() -> io::Result<()> {
         bin_dir: cli.bin_dir,
         host: cli.host,
         port: cli.port,
+        docker_mode: if cli.docker { Some(true) } else { None },
+        docker_project: cli.docker_project,
+        pageserver_port: cli.pageserver_port,
+        safekeeper_port: cli.safekeeper_port,
+        broker_port: cli.broker_port,
+        user: cli.user,
+        database: cli.database,
+        default_branch: cli.branch,
+        pg_version: cli.pg_version,
+        refresh_interval: cli.refresh,
+        show_logs: if cli.show_logs { Some(true) } else { None },
     };
 
     let config = Config::load(&overrides);
@@ -526,5 +581,57 @@ mod tests {
         let cli = cli.unwrap();
         assert_eq!(cli.dir.unwrap().to_str().unwrap(), "/tmp/.neon");
         assert!(matches!(cli.command, Some(SubCmd::Start)));
+    }
+
+    #[test]
+    fn cli_parses_docker_flag() {
+        let cli = Cli::try_parse_from([
+            "neon-tui",
+            "--docker",
+            "--docker-project",
+            "eliteonlineshop",
+        ]);
+        let cli = cli.unwrap();
+        assert!(cli.docker);
+        assert_eq!(cli.docker_project.unwrap(), "eliteonlineshop");
+    }
+
+    #[test]
+    fn cli_parses_all_flags() {
+        let cli = Cli::try_parse_from([
+            "neon-tui",
+            "--docker",
+            "--docker-project",
+            "myproject",
+            "--pageserver-port",
+            "9999",
+            "--safekeeper-port",
+            "5555",
+            "--broker-port",
+            "50052",
+            "--user",
+            "alice",
+            "--database",
+            "mydb",
+            "--branch",
+            "dev",
+            "--pg-version",
+            "16",
+            "--refresh",
+            "5",
+            "--show-logs",
+        ]);
+        let cli = cli.unwrap();
+        assert!(cli.docker);
+        assert_eq!(cli.docker_project.unwrap(), "myproject");
+        assert_eq!(cli.pageserver_port.unwrap(), 9999);
+        assert_eq!(cli.safekeeper_port.unwrap(), 5555);
+        assert_eq!(cli.broker_port.unwrap(), 50052);
+        assert_eq!(cli.user.unwrap(), "alice");
+        assert_eq!(cli.database.unwrap(), "mydb");
+        assert_eq!(cli.branch.unwrap(), "dev");
+        assert_eq!(cli.pg_version.unwrap(), 16);
+        assert_eq!(cli.refresh.unwrap(), 5);
+        assert!(cli.show_logs);
     }
 }
