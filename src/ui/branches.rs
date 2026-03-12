@@ -26,11 +26,12 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    let pid_header = if app.config.docker.mode { "Container" } else { "PID" };
     let header = Row::new(vec![
         Cell::from("Branch"),
         Cell::from("Status"),
         Cell::from("PG Port"),
-        Cell::from("PID"),
+        Cell::from(pid_header),
         Cell::from("Connection URL"),
     ])
     .style(
@@ -71,13 +72,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 branch
                     .docker_container
                     .as_deref()
-                    .map(|name| {
-                        if name.len() > 12 {
-                            name[..12].to_string()
-                        } else {
-                            name.to_string()
-                        }
-                    })
+                    .map(|name| short_container(name, &app.config.docker.compose_project))
                     .unwrap_or_else(|| "-".to_string())
             } else {
                 branch
@@ -115,8 +110,8 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         ratatui::layout::Constraint::Length(30),
         ratatui::layout::Constraint::Length(10),
         ratatui::layout::Constraint::Length(9),
-        ratatui::layout::Constraint::Length(8),
-        ratatui::layout::Constraint::Min(30),
+        ratatui::layout::Constraint::Length(16),
+        ratatui::layout::Constraint::Min(20),
     ];
 
     let table = Table::new(rows, widths)
@@ -132,6 +127,20 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let mut state = TableState::default();
     state.select(Some(app.selected_index));
     f.render_stateful_widget(table, area, &mut state);
+}
+
+/// Strip the Compose project prefix and numeric index suffix from a container name.
+/// `eliteonlineshop-compute-1` → `compute`
+fn short_container(name: &str, project: &str) -> String {
+    let s = name
+        .strip_prefix(&format!("{project}-"))
+        .unwrap_or(name);
+    if let Some(pos) = s.rfind('-') {
+        if s[pos + 1..].chars().all(|c| c.is_ascii_digit()) {
+            return s[..pos].to_string();
+        }
+    }
+    s.to_string()
 }
 
 /// Compute how deep a branch is in the tree (0 = root, 1 = child of root, etc.)

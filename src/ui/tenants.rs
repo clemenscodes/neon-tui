@@ -25,9 +25,8 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     }
 
     let header = Row::new(vec![
-        Cell::from("Tenant ID"),
-        Cell::from("Default / Branch"),
-        Cell::from("Timeline"),
+        Cell::from("Tenant ID / Branch"),
+        Cell::from("Timeline ID"),
     ])
     .style(
         Style::default()
@@ -40,12 +39,16 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let mut flat_index: usize = 0;
 
     for tenant in &app.state.tenants {
-        let default_marker = if tenant.is_default { "★" } else { "" };
+        let n = tenant.timelines.len();
+        let summary = if tenant.is_default {
+            format!("★  ({n} timeline{})", if n == 1 { "" } else { "s" })
+        } else {
+            format!("({n} timeline{})", if n == 1 { "" } else { "s" })
+        };
 
         let tenant_row = Row::new(vec![
             Cell::from(tenant.id.clone()),
-            Cell::from(default_marker),
-            Cell::from(""),
+            Cell::from(summary),
         ]);
 
         let tenant_row = if flat_index == app.selected_index {
@@ -61,22 +64,15 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         flat_index += 1;
 
         for tl in &tenant.timelines {
-            // Show first 12 chars of timeline id, truncated with "..."
-            let tl_short = if tl.id.len() > 12 {
-                format!("{}...", &tl.id[..12])
-            } else {
-                tl.id.clone()
-            };
-            let branch_col = tl
+            let branch_label = tl
                 .branch_name
                 .as_deref()
-                .unwrap_or("(no branch)")
+                .unwrap_or("(unnamed)")
                 .to_string();
 
             let sub_row = Row::new(vec![
-                Cell::from(format!("  \u{250b}\u{2501} {tl_short}")),
-                Cell::from(branch_col),
-                Cell::from(""),
+                Cell::from(format!("  \u{2517}\u{2501} {branch_label}")),
+                Cell::from(tl.id.clone()),
             ]);
 
             let sub_row = if flat_index == app.selected_index {
@@ -95,8 +91,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
 
     let widths = [
         ratatui::layout::Constraint::Length(36),
-        ratatui::layout::Constraint::Length(20),
-        ratatui::layout::Constraint::Min(12),
+        ratatui::layout::Constraint::Min(32),
     ];
 
     let table = Table::new(rows, widths)
