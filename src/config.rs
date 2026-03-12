@@ -31,6 +31,7 @@ pub struct ComputeConfig {
     pub host: String,
     pub port: u16,
     pub user: String,
+    pub password: Option<String>,
     pub database: String,
     pub default_branch: String,
     pub pg_version: u16,
@@ -72,6 +73,7 @@ struct FileCompute {
     host: Option<String>,
     port: Option<u16>,
     user: Option<String>,
+    password: Option<String>,
     database: Option<String>,
     default_branch: Option<String>,
     pg_version: Option<u16>,
@@ -116,6 +118,7 @@ pub struct CliOverrides {
     pub broker_port: Option<u16>,
     // compute
     pub user: Option<String>,
+    pub password: Option<String>,
     pub database: Option<String>,
     pub default_branch: Option<String>,
     pub pg_version: Option<u16>,
@@ -167,6 +170,11 @@ impl Config {
                     .or_else(|| env::var("COMPUTE_USER").ok())
                     .or(file_compute.user)
                     .unwrap_or_else(|| "test".to_string()),
+                password: cli
+                    .password
+                    .clone()
+                    .or_else(|| env::var("COMPUTE_PASSWORD").ok())
+                    .or(file_compute.password),
                 database: cli
                     .database
                     .clone()

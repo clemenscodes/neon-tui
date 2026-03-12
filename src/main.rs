@@ -69,6 +69,10 @@ struct Cli {
     #[arg(long, global = true)]
     user: Option<String>,
 
+    /// Compute database password (embedded in connection URLs; also read from COMPUTE_PASSWORD)
+    #[arg(long, global = true)]
+    password: Option<String>,
+
     /// Compute database name (default: neondb)
     #[arg(long, global = true)]
     database: Option<String>,
@@ -155,6 +159,7 @@ async fn main() -> io::Result<()> {
         safekeeper_port: cli.safekeeper_port,
         broker_port: cli.broker_port,
         user: cli.user,
+        password: cli.password,
         database: cli.database,
         default_branch: cli.branch,
         pg_version: cli.pg_version,

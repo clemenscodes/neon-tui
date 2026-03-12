@@ -840,10 +840,16 @@ pub async fn destroy(config: &Config) -> CommandResult {
 /// Get the connection URL for a branch.
 pub fn connection_url(config: &Config, branch: &str) -> String {
     let port = config.branch_port(branch);
-    format!(
-        "postgresql://{}@{}:{}/{}",
-        config.compute.user, config.compute.host, port, config.compute.database,
-    )
+    match &config.compute.password {
+        Some(pw) => format!(
+            "postgresql://{}:{}@{}:{}/{}",
+            config.compute.user, pw, config.compute.host, port, config.compute.database,
+        ),
+        None => format!(
+            "postgresql://{}@{}:{}/{}",
+            config.compute.user, config.compute.host, port, config.compute.database,
+        ),
+    }
 }
 
 /// Parse the output of `neon_local timeline list` to extract parent-child relationships.
