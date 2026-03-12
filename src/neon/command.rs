@@ -410,20 +410,18 @@ async fn run_docker_stop(container: &str) -> CommandResult {
     }
 }
 
-/// Stop all branch containers tracked in the Docker state file.
+/// Stop all branch compute containers for the given project.
 ///
 /// Branch containers are started via `docker run` outside of Compose, so
 /// `docker compose stop/down` does not touch them.  This function ensures
 /// they are cleaned up before the Compose stack is stopped.
-async fn stop_branch_containers() {
-    let state = docker::read_docker_branch_state();
-    for (_name, entry) in &state.branches {
-        if let Some(container) = &entry.container {
-            let _ = tokio::process::Command::new("docker")
-                .args(["stop", container])
-                .output()
-                .await;
-        }
+async fn stop_branch_containers(project: &str) {
+    let branches = docker::list_branch_containers(project);
+    for bc in &branches {
+        let _ = tokio::process::Command::new("docker")
+            .args(["stop", &bc.container_name])
+            .output()
+            .await;
     }
 }
 
@@ -611,7 +609,7 @@ pub async fn start(config: &Config) -> CommandResult {
 pub async fn stop(config: &Config) -> CommandResult {
     if config.docker.mode {
         // Stop branch containers first (they're outside of Compose).
-        stop_branch_containers().await;
+        stop_branch_containers(&config.docker.compose_project).await;
         return docker_compose(&config.docker.compose_project, &["stop"]).await;
     }
     let repo = &config.neon.repo_dir;
@@ -904,14 +902,9 @@ pub async fn stop_endpoint(config: &Config, name: &str) -> CommandResult {
             // Default branch is a Compose service.
             return docker_compose(&config.docker.compose_project, &["stop", "compute"]).await;
         }
-        // Other branches are standalone containers tracked in the state file.
-        let state = docker::read_docker_branch_state();
-        if let Some(entry) = state.branches.get(name) {
-            if let Some(container) = &entry.container {
-                return run_docker_stop(container).await;
-            }
-        }
-        return CommandResult::err(format!("Branch '{name}' not found in Docker state."));
+        // Other branches are standalone containers identified by label.
+        let container_name = docker::branch_container_name(&config.docker.compose_project, name);
+        return run_docker_stop(&container_name).await;
     }
     neon_local(config, &["endpoint", "stop", name]).await
 }
@@ -920,16 +913,13 @@ pub async fn stop_endpoint(config: &Config, name: &str) -> CommandResult {
 pub async fn destroy(config: &Config) -> CommandResult {
     if config.docker.mode {
         // Stop and remove all branch containers (started outside Compose with --rm).
-        stop_branch_containers().await;
+        stop_branch_containers(&config.docker.compose_project).await;
         // Tear down the Compose stack and remove volumes.
-        let result = docker_compose(
+        return docker_compose(
             &config.docker.compose_project,
             &["down", "--volumes", "--remove-orphans"],
         )
         .await;
-        // Clear the local branch state file.
-        let _ = std::fs::remove_file(docker::STATE_FILE);
-        return result;
     }
     let repo = &config.neon.repo_dir;
     if !repo.is_dir() {
@@ -950,8 +940,11 @@ pub async fn destroy(config: &Config) -> CommandResult {
 /// Get the connection URL for a branch.
 pub fn connection_url(config: &Config, branch: &str) -> String {
     let port = if config.docker.mode {
-        // In Docker mode, non-default branches store their port in the state file.
-        docker::docker_branch_port(branch).unwrap_or(config.compute.port)
+        // In Docker mode, look up the host port from Docker labels.
+        let host_port = docker::inspect_branch_container(&config.docker.compose_project, branch)
+            .map(|bc| bc.host_port)
+            .unwrap_or(0);
+        if host_port > 0 { host_port } else { config.compute.port }
     } else {
         config.branch_port(branch)
     };
@@ -1113,15 +1106,16 @@ async fn create_docker_branch(config: &Config, name: &str, parent: &str) -> Comm
             None => return CommandResult::err("Cannot fetch timelines from pageserver."),
         };
 
-    let state = docker::read_docker_branch_state();
-    let parent_timeline_id = if let Some(entry) = state.branches.get(parent) {
-        entry.timeline_id.clone()
-    } else if parent == config.compute.default_branch {
+    let parent_timeline_id = if parent == config.compute.default_branch {
         // Root timeline = timeline with no ancestor.
         match timelines.iter().find(|t| t.ancestor_timeline_id.is_none()) {
             Some(t) => t.timeline_id.clone(),
             None => return CommandResult::err("Cannot find root timeline in pageserver."),
         }
+    } else if let Some(bc) =
+        docker::inspect_branch_container(&config.docker.compose_project, parent)
+    {
+        bc.timeline_id
     } else {
         return CommandResult::err(format!("Parent branch '{parent}' not found."));
     };
@@ -1153,10 +1147,10 @@ async fn create_docker_branch(config: &Config, name: &str, parent: &str) -> Comm
     };
 
     // 5. Pick a free host port (scan upward from default compute port).
-    let used_ports: std::collections::HashSet<u16> = state
-        .branches
-        .values()
-        .map(|e| e.port)
+    let branch_containers = docker::list_branch_containers(&config.docker.compose_project);
+    let used_ports: std::collections::HashSet<u16> = branch_containers
+        .iter()
+        .map(|bc| bc.host_port)
         .chain(std::iter::once(config.compute.port))
         .collect();
     let new_port = ((config.compute.port + 1)..=65535)
@@ -1164,12 +1158,16 @@ async fn create_docker_branch(config: &Config, name: &str, parent: &str) -> Comm
         .unwrap_or(config.compute.port + 1);
 
     // 6. Start a new compute container for this branch.
-    let container_name = format!("{}-compute-{name}", config.docker.compose_project);
+    let container_name = docker::branch_container_name(&config.docker.compose_project, name);
     let network = format!("{}_default", config.docker.compose_project);
     let port_mapping = format!("{new_port}:55432");
     let tenant_env = format!("TENANT_ID={tenant_id}");
     let timeline_env = format!("TIMELINE_ID={new_timeline_id}");
     let pg_version_env = format!("PG_VERSION={pg_version}");
+    let label_project = format!("neon.project={}", config.docker.compose_project);
+    let label_branch = format!("neon.branch={name}");
+    let label_timeline = format!("neon.timeline={new_timeline_id}");
+    let label_parent = format!("neon.parent={parent}");
 
     let run_out = tokio::process::Command::new("docker")
         .args([
@@ -1177,6 +1175,10 @@ async fn create_docker_branch(config: &Config, name: &str, parent: &str) -> Comm
             "--name", &container_name,
             "--volumes-from", &existing_compute,
             "--network", &network,
+            "--label", &label_project,
+            "--label", &label_branch,
+            "--label", &label_timeline,
+            "--label", &label_parent,
             "-p", &port_mapping,
             "-e", &tenant_env,
             "-e", &timeline_env,
@@ -1203,53 +1205,39 @@ async fn create_docker_branch(config: &Config, name: &str, parent: &str) -> Comm
         ));
     }
 
-    // 8. Persist branch metadata.
-    let mut state = docker::read_docker_branch_state();
-    state.branches.insert(
-        name.to_string(),
-        docker::DockerBranchEntry {
-            timeline_id: new_timeline_id,
-            container: Some(container_name),
-            port: new_port,
-            parent: Some(parent.to_string()),
-        },
-    );
-    docker::save_docker_branch_state(&state);
-
+    // 8. Metadata is stored as Docker labels on the container — no file persistence needed.
     let url = connection_url(config, name);
     CommandResult::ok(format!("Branch '{name}' is ready.\nConnection URL: {url}"))
 }
 
-/// Delete a branch in Docker mode: stop its compute container and remove state.
+/// Delete a branch in Docker mode: stop its compute container and remove the timeline.
 async fn delete_docker_branch(config: &Config, name: &str) -> CommandResult {
-    let mut state = docker::read_docker_branch_state();
-    let entry = match state.branches.get(name) {
-        Some(e) => e.clone(),
-        None => return CommandResult::err(format!("Branch '{name}' not found in state.")),
-    };
+    let container_name = docker::branch_container_name(&config.docker.compose_project, name);
 
-    // Stop and remove the compute container if present.
-    if let Some(container) = &entry.container {
-        let _ = tokio::process::Command::new("docker")
-            .args(["stop", container])
-            .output()
-            .await;
-        let _ = tokio::process::Command::new("docker")
-            .args(["rm", "-f", container])
-            .output()
-            .await;
-    }
+    // Get timeline_id from Docker labels before stopping the container.
+    let timeline_id = docker::inspect_branch_container(&config.docker.compose_project, name)
+        .map(|bc| bc.timeline_id)
+        .unwrap_or_default();
 
-    let timeline_id = entry.timeline_id.clone();
-    state.branches.remove(name);
-    docker::save_docker_branch_state(&state);
+    // Stop and remove the compute container.
+    let _ = tokio::process::Command::new("docker")
+        .args(["stop", &container_name])
+        .output()
+        .await;
+    let _ = tokio::process::Command::new("docker")
+        .args(["rm", "-f", &container_name])
+        .output()
+        .await;
 
     // Also delete the timeline from the pageserver to avoid dangling timelines.
     let mut warning = String::new();
-    if let Some(tenant_id) = get_default_tenant_id(config).await {
-        let result = delete_timeline(config, &tenant_id, &timeline_id).await;
-        if !result.success {
-            warning = format!(" (warning: pageserver timeline delete failed: {})", result.stderr);
+    if !timeline_id.is_empty() {
+        if let Some(tenant_id) = get_default_tenant_id(config).await {
+            let result = delete_timeline(config, &tenant_id, &timeline_id).await;
+            if !result.success {
+                warning =
+                    format!(" (warning: pageserver timeline delete failed: {})", result.stderr);
+            }
         }
     }
 

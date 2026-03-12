@@ -1,49 +1,165 @@
 use std::collections::HashMap;
 use std::process::Stdio;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-// ── Docker branch state ───────────────────────────────────────────────────────
+// ── Docker label-based branch state ──────────────────────────────────────────
 //
-// Persisted to .neon-tui-docker-branches.json in the working directory.
-// Tracks branches created via the TUI in Docker mode (timeline ID, compute
-// container name, exposed host port, parent branch name).
+// Branch metadata is stored as Docker labels on the compute containers.
+// Docker is the source of truth — no local JSON state file is needed.
 
-/// Per-branch metadata stored in the local state file.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DockerBranchEntry {
+/// Metadata for a branch compute container, read from Docker labels.
+#[derive(Debug, Clone)]
+pub struct BranchContainer {
+    pub branch: String,
     pub timeline_id: String,
-    pub container: Option<String>,
-    pub port: u16,
     pub parent: Option<String>,
+    pub container_name: String,
+    pub host_port: u16,
+    pub running: bool,
 }
 
-/// Root of the persisted state file.
-#[derive(Debug, Default, Deserialize, Serialize)]
-pub struct DockerBranchState {
-    pub branches: HashMap<String, DockerBranchEntry>,
+// ── Serde helpers for `docker inspect` output ────────────────────────────────
+
+#[derive(Deserialize)]
+struct InspectEntry {
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "State")]
+    state: InspectState,
+    #[serde(rename = "Config")]
+    config: InspectConfig,
+    #[serde(rename = "NetworkSettings")]
+    network: InspectNetwork,
 }
 
-pub const STATE_FILE: &str = ".neon-tui-docker-branches.json";
+#[derive(Deserialize)]
+struct InspectState {
+    #[serde(rename = "Running")]
+    running: bool,
+    #[allow(dead_code)]
+    #[serde(rename = "Pid")]
+    pid: u32,
+    #[allow(dead_code)]
+    #[serde(rename = "StartedAt")]
+    started_at: String,
+}
 
-pub fn read_docker_branch_state() -> DockerBranchState {
-    let Ok(contents) = std::fs::read_to_string(STATE_FILE) else {
-        return DockerBranchState::default();
+#[derive(Deserialize)]
+struct InspectConfig {
+    #[serde(rename = "Labels")]
+    labels: HashMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct InspectNetwork {
+    #[serde(rename = "Ports")]
+    ports: HashMap<String, Option<Vec<PortBinding>>>,
+}
+
+#[derive(Deserialize)]
+struct PortBinding {
+    #[serde(rename = "HostPort")]
+    host_port: String,
+}
+
+/// List all branch compute containers for the given project by reading Docker labels.
+///
+/// Uses `docker ps -a --filter label=neon.project={project}` to find containers,
+/// then `docker inspect` to read their metadata labels and port bindings.
+pub fn list_branch_containers(project: &str) -> Vec<BranchContainer> {
+    // Step 1: get names of all containers matching the project label.
+    let filter = format!("label=neon.project={project}");
+    let output = std::process::Command::new("docker")
+        .args([
+            "ps", "-a",
+            "--filter", &filter,
+            "--format", "{{.Names}}",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+
+    let Ok(out) = output else {
+        return vec![];
     };
-    serde_json::from_str(&contents).unwrap_or_default()
-}
-
-pub fn save_docker_branch_state(state: &DockerBranchState) {
-    if let Ok(json) = serde_json::to_string_pretty(state) {
-        let _ = std::fs::write(STATE_FILE, json);
+    if !out.status.success() {
+        return vec![];
     }
+
+    let names: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.trim().to_string())
+        .collect();
+
+    if names.is_empty() {
+        return vec![];
+    }
+
+    // Step 2: inspect all containers at once.
+    let mut inspect_cmd = std::process::Command::new("docker");
+    inspect_cmd.arg("inspect");
+    for name in &names {
+        inspect_cmd.arg(name);
+    }
+    let inspect_out = inspect_cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+
+    let Ok(inspect_result) = inspect_out else {
+        return vec![];
+    };
+    if !inspect_result.status.success() {
+        return vec![];
+    }
+
+    let json_text = String::from_utf8_lossy(&inspect_result.stdout);
+    let entries: Vec<InspectEntry> = serde_json::from_str(&json_text).unwrap_or_default();
+
+    // Step 3: build BranchContainer from each entry.
+    entries
+        .into_iter()
+        .filter_map(|entry| {
+            let labels = &entry.config.labels;
+            let branch = labels.get("neon.branch")?.clone();
+            let timeline_id = labels.get("neon.timeline").cloned().unwrap_or_default();
+            let parent = labels.get("neon.parent").cloned();
+
+            let host_port = entry
+                .network
+                .ports
+                .get("55432/tcp")
+                .and_then(|opt| opt.as_ref())
+                .and_then(|bindings| bindings.first())
+                .and_then(|b| b.host_port.parse::<u16>().ok())
+                .unwrap_or(0);
+
+            let container_name = entry.name.trim_start_matches('/').to_string();
+
+            Some(BranchContainer {
+                branch,
+                timeline_id,
+                parent,
+                container_name,
+                host_port,
+                running: entry.state.running,
+            })
+        })
+        .collect()
 }
 
-/// Look up the host port for a Docker-mode branch.
-/// Returns None for the default branch (which uses config.compute.port directly).
-pub fn docker_branch_port(branch: &str) -> Option<u16> {
-    let state = read_docker_branch_state();
-    state.branches.get(branch).map(|e| e.port)
+/// Convenience wrapper: look up a single branch container by branch name.
+pub fn inspect_branch_container(project: &str, branch: &str) -> Option<BranchContainer> {
+    list_branch_containers(project)
+        .into_iter()
+        .find(|bc| bc.branch == branch)
+}
+
+/// Canonical container name for a branch compute container.
+pub fn branch_container_name(project: &str, branch: &str) -> String {
+    format!("{project}-compute-{branch}")
 }
 
 /// Parsed entry from `docker compose ps --format json`.

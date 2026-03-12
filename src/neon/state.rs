@@ -192,13 +192,13 @@ fn build_docker_tenants(config: &Config) -> Vec<TenantInfo> {
     // There is typically one default tenant; treat the first as default.
     let first_id = tenant_list.first().map(|t| t.id.clone());
 
-    // Build timeline_id → branch_name map from the docker branch state file.
-    let branch_state = docker::read_docker_branch_state();
-    let mut timeline_to_branch: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    for (branch_name, entry) in &branch_state.branches {
-        timeline_to_branch.insert(entry.timeline_id.clone(), branch_name.clone());
-    }
+    // Build timeline_id → branch_name map from Docker labels.
+    let project = &config.docker.compose_project;
+    let branch_containers = docker::list_branch_containers(project);
+    let timeline_to_branch: std::collections::HashMap<String, String> = branch_containers
+        .iter()
+        .map(|bc| (bc.timeline_id.clone(), bc.branch.clone()))
+        .collect();
 
     tenant_list
         .into_iter()
@@ -312,37 +312,29 @@ fn build_docker_branches(containers: &[docker::DockerPs], config: &Config) -> Ve
         docker_container: default_container,
     }];
 
-    // Add branches created via the TUI (stored in state file).
-    let state = docker::read_docker_branch_state();
-    for (name, entry) in &state.branches {
-        // Determine liveness by checking whether the compute container is running.
-        let running = entry.container.as_deref().map_or(false, |cname| {
-            containers.iter().any(|c| c.name == cname && c.is_running())
-                // Also check via a fresh `docker inspect` in case the container was
-                // started outside of compose (docker run).
-                || {
-                    std::process::Command::new("docker")
-                        .args(["inspect", "--format", "{{.State.Running}}", cname])
-                        .output()
-                        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
-                        .unwrap_or(false)
-                }
-        });
-        let branch_status = if running { Status::Up } else { Status::Down };
+    // Add branches created via the TUI (discovered via Docker labels).
+    let project = &config.docker.compose_project;
+    let branch_containers = docker::list_branch_containers(project);
+    for bc in &branch_containers {
+        // Skip the default branch — it is already shown as a Compose service above.
+        if bc.branch == *default_branch {
+            continue;
+        }
+        let branch_status = if bc.running { Status::Up } else { Status::Down };
         let branch_pid = if branch_status == Status::Up {
-            entry.container.as_deref().and_then(docker::container_pid)
+            docker::container_pid(&bc.container_name)
         } else {
             None
         };
         branches.push(BranchInfo {
-            name: name.clone(),
+            name: bc.branch.clone(),
             status: branch_status,
-            pg_port: entry.port,
+            pg_port: bc.host_port,
             pid: branch_pid,
             is_default: false,
-            parent: entry.parent.clone(),
+            parent: bc.parent.clone(),
             log_file: None,
-            docker_container: entry.container.clone(),
+            docker_container: Some(bc.container_name.clone()),
         });
     }
 
