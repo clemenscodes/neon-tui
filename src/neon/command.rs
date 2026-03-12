@@ -368,10 +368,39 @@ async fn stop_pg_ctl(pg_ctl: &Path, db_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+// ── Docker Compose helpers ────────────────────────────────────────────────────
+
+/// Run `docker compose --project-name <project> <args>`.
+async fn docker_compose(project: &str, args: &[&str]) -> CommandResult {
+    let mut full_args = vec!["compose", "--project-name", project];
+    full_args.extend_from_slice(args);
+    let output = tokio::process::Command::new("docker")
+        .args(&full_args)
+        .output()
+        .await;
+    match output {
+        Ok(out) => CommandResult {
+            success: out.status.success(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        },
+        Err(e) => CommandResult::err(format!("docker compose failed: {e}")),
+    }
+}
+
+fn docker_unsupported(op: &str) -> CommandResult {
+    CommandResult::err(format!(
+        "{op} is not supported in Docker mode. Manage containers with docker compose directly."
+    ))
+}
+
 // ── Public API: Commands ─────────────────────────────────────────────────────
 
 /// Initialize Neon repository.
 pub async fn init(config: &Config) -> CommandResult {
+    if config.docker.mode {
+        return docker_unsupported("init");
+    }
     let repo = &config.neon.repo_dir;
     if repo.is_dir() {
         return CommandResult::err(format!(
@@ -429,6 +458,9 @@ pub async fn init(config: &Config) -> CommandResult {
 
 /// Start all Neon services + default endpoint.
 pub async fn start(config: &Config) -> CommandResult {
+    if config.docker.mode {
+        return docker_compose(&config.docker.compose_project, &["up", "-d"]).await;
+    }
     let repo = &config.neon.repo_dir;
     if !repo.is_dir() || !repo.join("config").exists() {
         return CommandResult::err("Neon not initialized. Run 'init' first.");
@@ -544,6 +576,9 @@ pub async fn start(config: &Config) -> CommandResult {
 
 /// Stop all Neon services.
 pub async fn stop(config: &Config) -> CommandResult {
+    if config.docker.mode {
+        return docker_compose(&config.docker.compose_project, &["stop"]).await;
+    }
     let repo = &config.neon.repo_dir;
     if !repo.is_dir() {
         return CommandResult::err("Neon not initialized.");
@@ -606,6 +641,9 @@ pub async fn status(config: &Config) -> CommandResult {
 
 /// Create a new database branch.
 pub async fn create_branch(config: &Config, name: &str, parent: &str) -> CommandResult {
+    if config.docker.mode {
+        return docker_unsupported("branch creation");
+    }
     let repo = &config.neon.repo_dir;
     if !repo.is_dir() {
         return CommandResult::err("Neon not initialized.");
@@ -695,6 +733,9 @@ pub async fn create_branch(config: &Config, name: &str, parent: &str) -> Command
 
 /// Delete a branch endpoint.
 pub async fn delete_branch(config: &Config, name: &str) -> CommandResult {
+    if config.docker.mode {
+        return docker_unsupported("branch deletion");
+    }
     if name == config.compute.default_branch {
         return CommandResult::err(format!("Cannot delete the default branch '{name}'."));
     }
@@ -753,6 +794,13 @@ pub async fn delete_branch(config: &Config, name: &str) -> CommandResult {
 
 /// Start (or create+start) a branch endpoint.
 pub async fn start_endpoint(config: &Config, name: &str) -> CommandResult {
+    if config.docker.mode {
+        return docker_compose(
+            &config.docker.compose_project,
+            &["start", name],
+        )
+        .await;
+    }
     let endpoint_result = neon_local(config, &["endpoint", "list"]).await;
 
     if endpoint_result.stdout.contains(name) {
@@ -816,11 +864,17 @@ pub async fn start_endpoint(config: &Config, name: &str) -> CommandResult {
 
 /// Stop a branch endpoint.
 pub async fn stop_endpoint(config: &Config, name: &str) -> CommandResult {
+    if config.docker.mode {
+        return docker_compose(&config.docker.compose_project, &["stop", name]).await;
+    }
     neon_local(config, &["endpoint", "stop", name]).await
 }
 
 /// Destroy all Neon data.
 pub async fn destroy(config: &Config) -> CommandResult {
+    if config.docker.mode {
+        return docker_unsupported("destroy");
+    }
     let repo = &config.neon.repo_dir;
     if !repo.is_dir() {
         return CommandResult::ok("Nothing to destroy.");
