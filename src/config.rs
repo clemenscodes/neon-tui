@@ -9,6 +9,15 @@ pub struct Config {
     pub compute: ComputeConfig,
     pub ports: PortsConfig,
     pub ui: UiConfig,
+    pub docker: DockerConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct DockerConfig {
+    /// When true, detect component status via `docker compose ps` instead of PID files.
+    pub mode: bool,
+    /// Docker Compose project name (defaults to the directory name).
+    pub compose_project: String,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +58,7 @@ struct FileConfig {
     compute: Option<FileCompute>,
     ports: Option<FilePorts>,
     ui: Option<FileUi>,
+    docker: Option<FileDocker>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -83,6 +93,12 @@ struct FileUi {
     show_logs: Option<bool>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct FileDocker {
+    mode: Option<bool>,
+    compose_project: Option<String>,
+}
+
 /// CLI overrides passed from clap
 #[derive(Debug, Default)]
 pub struct CliOverrides {
@@ -102,6 +118,7 @@ impl Config {
         let file_compute = file_cfg.compute.unwrap_or_default();
         let file_ports = file_cfg.ports.unwrap_or_default();
         let file_ui = file_cfg.ui.unwrap_or_default();
+        let file_docker = file_cfg.docker.unwrap_or_default();
 
         Config {
             neon: NeonConfig {
@@ -169,6 +186,17 @@ impl Config {
                 refresh_interval_secs: file_ui.refresh_interval.unwrap_or(2),
                 show_logs: file_ui.show_logs.unwrap_or(false),
             },
+            docker: DockerConfig {
+                mode: env::var("NEON_DOCKER_MODE")
+                    .ok()
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .or(file_docker.mode)
+                    .unwrap_or(false),
+                compose_project: env::var("NEON_DOCKER_PROJECT")
+                    .ok()
+                    .or(file_docker.compose_project)
+                    .unwrap_or_else(detect_compose_project),
+            },
         }
     }
 
@@ -202,6 +230,17 @@ impl Config {
 
 fn env_u16(key: &str) -> Option<u16> {
     env::var(key).ok().and_then(|v| v.parse().ok())
+}
+
+/// Infer the Docker Compose project name from the current working directory.
+fn detect_compose_project() -> String {
+    std::env::current_dir()
+        .ok()
+        .and_then(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().to_lowercase().replace('-', "").replace('_', ""))
+        })
+        .unwrap_or_else(|| "neon".to_string())
 }
 
 fn load_config_file(explicit_path: Option<&Path>) -> FileConfig {
@@ -289,5 +328,13 @@ mod tests {
     fn show_logs_defaults_to_false() {
         let cfg = Config::load(&CliOverrides::default());
         assert!(!cfg.ui.show_logs);
+    }
+
+    #[test]
+    fn docker_config_fields_accessible() {
+        // Verify DockerConfig fields compile and have the expected types.
+        let cfg = Config::load(&CliOverrides::default());
+        let _mode: bool = cfg.docker.mode;
+        let _project: &str = &cfg.docker.compose_project;
     }
 }

@@ -4,7 +4,7 @@ use std::time::SystemTime;
 use serde::Deserialize;
 
 use crate::config::Config;
-use crate::neon::process;
+use crate::neon::{docker, process};
 
 /// Complete snapshot of local Neon state.
 #[derive(Debug, Clone)]
@@ -24,6 +24,8 @@ pub struct ComponentInfo {
     pub port: u16,
     pub log_file: Option<PathBuf>,
     pub start_time: Option<SystemTime>,
+    /// Docker container name, populated when running in docker mode.
+    pub docker_container: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +59,8 @@ pub struct BranchInfo {
     pub is_default: bool,
     pub parent: Option<String>,
     pub log_file: Option<PathBuf>,
+    /// Docker container name, populated when running in docker mode.
+    pub docker_container: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -71,8 +75,16 @@ struct EndpointJson {
     pg_port: Option<u16>,
 }
 
-/// Read the full Neon state from the filesystem and running processes.
+/// Read the full Neon state — dispatches to Docker or local mode.
 pub fn read_state(config: &Config) -> NeonState {
+    if config.docker.mode {
+        return read_docker_state(config);
+    }
+    read_local_state(config)
+}
+
+/// Read state from local filesystem / processes (original behaviour).
+fn read_local_state(config: &Config) -> NeonState {
     let repo_dir = &config.neon.repo_dir;
     let initialized = repo_dir.is_dir() && repo_dir.join("config").exists();
 
@@ -106,6 +118,94 @@ pub fn read_state(config: &Config) -> NeonState {
         tenants,
         last_refresh: SystemTime::now(),
     }
+}
+
+// ── Docker mode ──────────────────────────────────────────────────────────────
+
+/// Read Neon component state from Docker Compose container status.
+///
+/// Enabled when `config.docker.mode == true` (e.g. set `NEON_DOCKER_MODE=1`).
+///
+/// In this mode the TUI shows the six Compose services as components and the
+/// compute container as the single "main" branch.  Log lines are fetched via
+/// `docker logs` rather than read from local files.
+fn read_docker_state(config: &Config) -> NeonState {
+    let project = &config.docker.compose_project;
+    let containers = docker::list_containers(project);
+
+    // The stack is "initialized" if at least one Neon storage service exists.
+    let neon_services = ["storage-broker", "pageserver", "safekeeper", "compute"];
+    let initialized = containers
+        .iter()
+        .any(|c| neon_services.contains(&c.service.as_str()));
+
+    let components = build_docker_components(&containers, config);
+    let branches = build_docker_branches(&containers, config);
+
+    NeonState {
+        initialized,
+        components,
+        branches,
+        tenants: vec![],
+        last_refresh: SystemTime::now(),
+    }
+}
+
+/// Map Docker Compose services to [`ComponentInfo`] entries shown in the Components panel.
+fn build_docker_components(
+    containers: &[docker::DockerPs],
+    config: &Config,
+) -> Vec<ComponentInfo> {
+    // (docker-service-name, display-name, host-port)
+    let services: &[(&str, &str, u16)] = &[
+        ("storage-broker", "storage_broker", config.ports.storage_broker),
+        ("pageserver",     "pageserver",     config.ports.pageserver_http),
+        ("safekeeper",     "safekeeper",     config.ports.safekeeper_pg),
+        ("compute",        "compute",        config.compute.port),
+        ("minio",          "minio",          9000),
+        ("app",            "app",            8080),
+    ];
+
+    services
+        .iter()
+        .map(|(svc, display, port)| {
+            let container = containers.iter().find(|c| c.service == *svc);
+            let status = match container {
+                Some(c) if c.is_running() => Status::Up,
+                _ => Status::Down,
+            };
+            let docker_container = container.map(|c| c.name.clone());
+            ComponentInfo {
+                name: display.to_string(),
+                status,
+                pid: None,
+                port: *port,
+                log_file: None,
+                start_time: None,
+                docker_container,
+            }
+        })
+        .collect()
+}
+
+/// Build the Branches panel in Docker mode: one entry per compute-like container.
+fn build_docker_branches(containers: &[docker::DockerPs], config: &Config) -> Vec<BranchInfo> {
+    let default_branch = &config.compute.default_branch;
+    let compute = containers.iter().find(|c| c.service == "compute");
+    let status = match compute {
+        Some(c) if c.is_running() => Status::Up,
+        _ => Status::Down,
+    };
+    vec![BranchInfo {
+        name: default_branch.clone(),
+        status,
+        pg_port: config.compute.port,
+        pid: None,
+        is_default: true,
+        parent: None,
+        log_file: None,
+        docker_container: compute.map(|c| c.name.clone()),
+    }]
 }
 
 fn read_components(config: &Config) -> Vec<ComponentInfo> {
@@ -191,6 +291,7 @@ fn read_component(
         port,
         log_file,
         start_time,
+        docker_container: None,
     }
 }
 
@@ -217,6 +318,7 @@ fn read_branches(config: &Config) -> Vec<BranchInfo> {
             is_default: true,
             parent: None,
             log_file: compute_log_path(&endpoints_dir, default_branch),
+            docker_container: None,
         }
     };
     branches.push(default_info);
@@ -267,6 +369,7 @@ fn read_branch_endpoint(config: &Config, name: &str, json_path: &Path) -> Branch
         is_default,
         parent: None, // populated later from timeline hierarchy
         log_file: compute_log_path(&endpoints_dir, name),
+        docker_container: None,
     }
 }
 

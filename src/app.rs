@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::neon::command;
+use crate::neon::{command, docker};
 use crate::neon::state::{self, NeonState};
 
 /// The main panels at the top level.
@@ -692,21 +692,28 @@ impl App {
     }
 
     pub fn refresh_logs(&mut self) {
-        let log_file = match self.log_panel {
+        // Each log source provides either a local file path or a docker container name.
+        let (log_file, docker_container) = match self.log_panel {
             Panel::Components => match self.log_source {
                 idx if idx < self.state.components.len() => {
-                    self.state.components[idx].log_file.clone()
+                    let c = &self.state.components[idx];
+                    (c.log_file.clone(), c.docker_container.clone())
                 }
-                _ => None,
+                _ => (None, None),
             },
             Panel::Branches => match self.log_source {
-                idx if idx < self.state.branches.len() => self.state.branches[idx].log_file.clone(),
-                _ => None,
+                idx if idx < self.state.branches.len() => {
+                    let b = &self.state.branches[idx];
+                    (b.log_file.clone(), b.docker_container.clone())
+                }
+                _ => (None, None),
             },
-            Panel::Tenants => None,
+            Panel::Tenants => (None, None),
         };
 
-        self.log_lines = if let Some(path) = log_file {
+        self.log_lines = if let Some(container) = docker_container {
+            docker::container_logs(&container, 500)
+        } else if let Some(path) = log_file {
             read_log_tail(&path, 500)
         } else {
             vec!["No log file available.".to_string()]
