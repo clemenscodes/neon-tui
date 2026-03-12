@@ -242,14 +242,13 @@ fn build_docker_components(
     containers: &[docker::DockerPs],
     config: &Config,
 ) -> Vec<ComponentInfo> {
-    // (docker-service-name, display-name, host-port)
+    // Core Neon stack — app/app-dev are application concerns, not Neon infrastructure.
     let services: &[(&str, &str, u16)] = &[
+        ("minio",          "minio",          9000),
         ("storage-broker", "storage_broker", config.ports.storage_broker),
         ("pageserver",     "pageserver",     config.ports.pageserver_http),
         ("safekeeper",     "safekeeper",     config.ports.safekeeper_pg),
         ("compute",        "compute",        config.compute.port),
-        ("minio",          "minio",          9000),
-        ("app",            "app",            8080),
     ];
 
     services
