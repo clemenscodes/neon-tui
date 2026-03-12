@@ -240,24 +240,58 @@ fn build_docker_components(
         .collect()
 }
 
-/// Build the Branches panel in Docker mode: one entry per compute-like container.
+/// Build the Branches panel in Docker mode.
+///
+/// Shows the default branch (from `docker compose ps`) plus any extra branches
+/// created via the TUI (persisted in `.neon-tui-docker-branches.json`).
 fn build_docker_branches(containers: &[docker::DockerPs], config: &Config) -> Vec<BranchInfo> {
     let default_branch = &config.compute.default_branch;
     let compute = containers.iter().find(|c| c.service == "compute");
-    let status = match compute {
+    let default_status = match compute {
         Some(c) if c.is_running() => Status::Up,
         _ => Status::Down,
     };
-    vec![BranchInfo {
+
+    let mut branches = vec![BranchInfo {
         name: default_branch.clone(),
-        status,
+        status: default_status,
         pg_port: config.compute.port,
         pid: None,
         is_default: true,
         parent: None,
         log_file: None,
         docker_container: compute.map(|c| c.name.clone()),
-    }]
+    }];
+
+    // Add branches created via the TUI (stored in state file).
+    let state = docker::read_docker_branch_state();
+    for (name, entry) in &state.branches {
+        // Determine liveness by checking whether the compute container is running.
+        let running = entry.container.as_deref().map_or(false, |cname| {
+            containers.iter().any(|c| c.name == cname && c.is_running())
+                // Also check via a fresh `docker inspect` in case the container was
+                // started outside of compose (docker run).
+                || {
+                    std::process::Command::new("docker")
+                        .args(["inspect", "--format", "{{.State.Running}}", cname])
+                        .output()
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
+                        .unwrap_or(false)
+                }
+        });
+        branches.push(BranchInfo {
+            name: name.clone(),
+            status: if running { Status::Up } else { Status::Down },
+            pg_port: entry.port,
+            pid: None,
+            is_default: false,
+            parent: entry.parent.clone(),
+            log_file: None,
+            docker_container: entry.container.clone(),
+        });
+    }
+
+    branches
 }
 
 fn read_components(config: &Config) -> Vec<ComponentInfo> {

@@ -1,6 +1,50 @@
+use std::collections::HashMap;
 use std::process::Stdio;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+// ── Docker branch state ───────────────────────────────────────────────────────
+//
+// Persisted to .neon-tui-docker-branches.json in the working directory.
+// Tracks branches created via the TUI in Docker mode (timeline ID, compute
+// container name, exposed host port, parent branch name).
+
+/// Per-branch metadata stored in the local state file.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DockerBranchEntry {
+    pub timeline_id: String,
+    pub container: Option<String>,
+    pub port: u16,
+    pub parent: Option<String>,
+}
+
+/// Root of the persisted state file.
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct DockerBranchState {
+    pub branches: HashMap<String, DockerBranchEntry>,
+}
+
+const STATE_FILE: &str = ".neon-tui-docker-branches.json";
+
+pub fn read_docker_branch_state() -> DockerBranchState {
+    let Ok(contents) = std::fs::read_to_string(STATE_FILE) else {
+        return DockerBranchState::default();
+    };
+    serde_json::from_str(&contents).unwrap_or_default()
+}
+
+pub fn save_docker_branch_state(state: &DockerBranchState) {
+    if let Ok(json) = serde_json::to_string_pretty(state) {
+        let _ = std::fs::write(STATE_FILE, json);
+    }
+}
+
+/// Look up the host port for a Docker-mode branch.
+/// Returns None for the default branch (which uses config.compute.port directly).
+pub fn docker_branch_port(branch: &str) -> Option<u16> {
+    let state = read_docker_branch_state();
+    state.branches.get(branch).map(|e| e.port)
+}
 
 /// Parsed entry from `docker compose ps --format json`.
 #[derive(Debug, Deserialize)]

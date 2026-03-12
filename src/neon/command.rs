@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::process::Command;
 
 use crate::config::Config;
-use crate::neon::process;
+use crate::neon::{docker, process};
 
 /// Result of running a neon_local command.
 #[derive(Debug, Clone)]
@@ -642,7 +642,7 @@ pub async fn status(config: &Config) -> CommandResult {
 /// Create a new database branch.
 pub async fn create_branch(config: &Config, name: &str, parent: &str) -> CommandResult {
     if config.docker.mode {
-        return docker_unsupported("branch creation");
+        return create_docker_branch(config, name, parent).await;
     }
     let repo = &config.neon.repo_dir;
     if !repo.is_dir() {
@@ -734,7 +734,7 @@ pub async fn create_branch(config: &Config, name: &str, parent: &str) -> Command
 /// Delete a branch endpoint.
 pub async fn delete_branch(config: &Config, name: &str) -> CommandResult {
     if config.docker.mode {
-        return docker_unsupported("branch deletion");
+        return delete_docker_branch(config, name).await;
     }
     if name == config.compute.default_branch {
         return CommandResult::err(format!("Cannot delete the default branch '{name}'."));
@@ -893,7 +893,12 @@ pub async fn destroy(config: &Config) -> CommandResult {
 
 /// Get the connection URL for a branch.
 pub fn connection_url(config: &Config, branch: &str) -> String {
-    let port = config.branch_port(branch);
+    let port = if config.docker.mode {
+        // In Docker mode, non-default branches store their port in the state file.
+        docker::docker_branch_port(branch).unwrap_or(config.compute.port)
+    } else {
+        config.branch_port(branch)
+    };
     match &config.compute.password {
         Some(pw) => format!(
             "postgresql://{}:{}@{}:{}/{}",
@@ -1003,6 +1008,188 @@ fn extract_branch_name(line: &str) -> Option<String> {
     // Strip any trailing colon (from "┗━ @LSN: name" format — the name comes after colon)
     // Actually in "┗━ @0/1234: develop", "develop" is the last token, which is correct
     Some(name.to_string())
+}
+
+// ── Docker-mode branch management ────────────────────────────────────────────
+
+/// Create a branch in Docker mode by:
+///   1. Creating a timeline fork in the pageserver via its HTTP API.
+///   2. Starting a new compute container pointing at the new timeline.
+///   3. Persisting branch metadata to `.neon-tui-docker-branches.json`.
+async fn create_docker_branch(config: &Config, name: &str, parent: &str) -> CommandResult {
+    #[derive(serde::Deserialize)]
+    struct TenantEntry {
+        id: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct TimelineEntry {
+        timeline_id: String,
+        ancestor_timeline_id: Option<String>,
+    }
+
+    let ps_port = config.ports.pageserver_http;
+    let base = format!("http://127.0.0.1:{ps_port}/v1");
+
+    // 1. Get default tenant ID.
+    let tenants: Vec<TenantEntry> = match ureq::get(&format!("{base}/tenant"))
+        .call()
+        .ok()
+        .and_then(|r| r.into_string().ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+    {
+        Some(t) => t,
+        None => return CommandResult::err("Cannot reach pageserver. Is it running?"),
+    };
+    let tenant_id = match tenants.into_iter().next() {
+        Some(t) => t.id,
+        None => return CommandResult::err("No tenants found in pageserver."),
+    };
+
+    // 2. Fetch timelines to resolve the parent branch's timeline ID.
+    let timelines: Vec<TimelineEntry> =
+        match ureq::get(&format!("{base}/tenant/{tenant_id}/timeline"))
+            .call()
+            .ok()
+            .and_then(|r| r.into_string().ok())
+            .and_then(|s| serde_json::from_str(&s).ok())
+        {
+            Some(t) => t,
+            None => return CommandResult::err("Cannot fetch timelines from pageserver."),
+        };
+
+    let state = docker::read_docker_branch_state();
+    let parent_timeline_id = if let Some(entry) = state.branches.get(parent) {
+        entry.timeline_id.clone()
+    } else if parent == config.compute.default_branch {
+        // Root timeline = timeline with no ancestor.
+        match timelines.iter().find(|t| t.ancestor_timeline_id.is_none()) {
+            Some(t) => t.timeline_id.clone(),
+            None => return CommandResult::err("Cannot find root timeline in pageserver."),
+        }
+    } else {
+        return CommandResult::err(format!("Parent branch '{parent}' not found."));
+    };
+
+    // 3. Create the new timeline.
+    let new_timeline_id = generate_hex_id();
+    let pg_version = config.compute.pg_version;
+    let body = format!(
+        r#"{{"new_timeline_id":"{new_timeline_id}","ancestor_timeline_id":"{parent_timeline_id}","pg_version":{pg_version}}}"#
+    );
+    let resp = ureq::post(&format!("{base}/tenant/{tenant_id}/timeline"))
+        .set("Content-Type", "application/json")
+        .send_string(&body);
+    if let Err(e) = resp {
+        return CommandResult::err(format!("Pageserver rejected timeline creation: {e}"));
+    }
+
+    // 4. Get the compute image from the existing compose compute container.
+    let existing_compute = format!("{}-compute-1", config.docker.compose_project);
+    let image_out = tokio::process::Command::new("docker")
+        .args(["inspect", "--format", "{{.Config.Image}}", &existing_compute])
+        .output()
+        .await;
+    let compute_image = match image_out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => return CommandResult::err(format!(
+            "Cannot inspect compute container '{existing_compute}'. Is it running?"
+        )),
+    };
+
+    // 5. Pick a free host port (scan upward from default compute port).
+    let used_ports: std::collections::HashSet<u16> = state
+        .branches
+        .values()
+        .map(|e| e.port)
+        .chain(std::iter::once(config.compute.port))
+        .collect();
+    let new_port = ((config.compute.port + 1)..=65535)
+        .find(|p| !used_ports.contains(p) && !process::is_port_listening(*p))
+        .unwrap_or(config.compute.port + 1);
+
+    // 6. Start a new compute container for this branch.
+    let container_name = format!("neon-tui-{name}-compute");
+    let network = format!("{}_default", config.docker.compose_project);
+    let port_mapping = format!("{new_port}:55432");
+    let tenant_env = format!("TENANT_ID={tenant_id}");
+    let timeline_env = format!("TIMELINE_ID={new_timeline_id}");
+    let pg_version_env = format!("PG_VERSION={pg_version}");
+
+    let run_out = tokio::process::Command::new("docker")
+        .args([
+            "run", "--rm", "-d",
+            "--name", &container_name,
+            "--volumes-from", &existing_compute,
+            "--network", &network,
+            "-p", &port_mapping,
+            "-e", &tenant_env,
+            "-e", &timeline_env,
+            "-e", &pg_version_env,
+            "--entrypoint", "/shell/compute.sh",
+            &compute_image,
+        ])
+        .output()
+        .await;
+
+    match run_out {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => return CommandResult::err(format!(
+            "Failed to start compute container: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        Err(e) => return CommandResult::err(format!("docker run failed: {e}")),
+    }
+
+    // 7. Wait for the compute to accept connections.
+    if !wait_for_port(new_port, Duration::from_secs(30)).await {
+        return CommandResult::err(format!(
+            "Compute for branch '{name}' did not start within 30 s."
+        ));
+    }
+
+    // 8. Persist branch metadata.
+    let mut state = docker::read_docker_branch_state();
+    state.branches.insert(
+        name.to_string(),
+        docker::DockerBranchEntry {
+            timeline_id: new_timeline_id,
+            container: Some(container_name),
+            port: new_port,
+            parent: Some(parent.to_string()),
+        },
+    );
+    docker::save_docker_branch_state(&state);
+
+    let url = connection_url(config, name);
+    CommandResult::ok(format!("Branch '{name}' is ready.\nConnection URL: {url}"))
+}
+
+/// Delete a branch in Docker mode: stop its compute container and remove state.
+async fn delete_docker_branch(_config: &Config, name: &str) -> CommandResult {
+    let mut state = docker::read_docker_branch_state();
+    let entry = match state.branches.get(name) {
+        Some(e) => e.clone(),
+        None => return CommandResult::err(format!("Branch '{name}' not found in state.")),
+    };
+
+    // Stop and remove the compute container if present.
+    if let Some(container) = &entry.container {
+        let _ = tokio::process::Command::new("docker")
+            .args(["stop", container])
+            .output()
+            .await;
+        let _ = tokio::process::Command::new("docker")
+            .args(["rm", "-f", container])
+            .output()
+            .await;
+    }
+
+    state.branches.remove(name);
+    docker::save_docker_branch_state(&state);
+
+    CommandResult::ok(format!(
+        "Branch '{name}' deleted. Timeline data is preserved in the pageserver."
+    ))
 }
 
 /// Generate a random 32-char hex string for tenant/timeline IDs.
