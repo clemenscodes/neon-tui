@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::cursor::{Hide, Show};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -289,9 +290,11 @@ async fn run_event_loop(
                     if let Some(url) = app.selected_branch_psql_url() {
                         disable_raw_mode()?;
                         io::stdout().execute(LeaveAlternateScreen)?;
+                        io::stdout().execute(Show)?;
 
                         let _ = std::process::Command::new("psql").arg(&url).status();
 
+                        io::stdout().execute(Hide)?;
                         enable_raw_mode()?;
                         io::stdout().execute(EnterAlternateScreen)?;
                         terminal.clear()?;
