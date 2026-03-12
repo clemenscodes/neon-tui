@@ -1108,7 +1108,7 @@ async fn create_docker_branch(config: &Config, name: &str, parent: &str) -> Comm
         .unwrap_or(config.compute.port + 1);
 
     // 6. Start a new compute container for this branch.
-    let container_name = format!("neon-tui-{name}-compute");
+    let container_name = format!("{}-compute-{name}", config.docker.compose_project);
     let network = format!("{}_default", config.docker.compose_project);
     let port_mapping = format!("{new_port}:55432");
     let tenant_env = format!("TENANT_ID={tenant_id}");

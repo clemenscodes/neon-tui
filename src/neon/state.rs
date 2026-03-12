@@ -259,17 +259,19 @@ fn build_docker_components(
                 _ => Status::Down,
             };
             let docker_container = container.map(|c| c.name.clone());
-            let start_time = if status == Status::Up {
-                docker_container
+            let (pid, start_time) = if status == Status::Up {
+                let p = docker_container.as_deref().and_then(docker::container_pid);
+                let t = docker_container
                     .as_deref()
-                    .and_then(docker::container_started_at)
+                    .and_then(docker::container_started_at);
+                (p, t)
             } else {
-                None
+                (None, None)
             };
             ComponentInfo {
                 name: display.to_string(),
                 status,
-                pid: None,
+                pid,
                 port: *port,
                 log_file: None,
                 start_time,
@@ -291,15 +293,21 @@ fn build_docker_branches(containers: &[docker::DockerPs], config: &Config) -> Ve
         _ => Status::Down,
     };
 
+    let default_container = compute.map(|c| c.name.clone());
+    let default_pid = if default_status == Status::Up {
+        default_container.as_deref().and_then(docker::container_pid)
+    } else {
+        None
+    };
     let mut branches = vec![BranchInfo {
         name: default_branch.clone(),
         status: default_status,
         pg_port: config.compute.port,
-        pid: None,
+        pid: default_pid,
         is_default: true,
         parent: None,
         log_file: None,
-        docker_container: compute.map(|c| c.name.clone()),
+        docker_container: default_container,
     }];
 
     // Add branches created via the TUI (stored in state file).
@@ -318,11 +326,17 @@ fn build_docker_branches(containers: &[docker::DockerPs], config: &Config) -> Ve
                         .unwrap_or(false)
                 }
         });
+        let branch_status = if running { Status::Up } else { Status::Down };
+        let branch_pid = if branch_status == Status::Up {
+            entry.container.as_deref().and_then(docker::container_pid)
+        } else {
+            None
+        };
         branches.push(BranchInfo {
             name: name.clone(),
-            status: if running { Status::Up } else { Status::Down },
+            status: branch_status,
             pg_port: entry.port,
-            pid: None,
+            pid: branch_pid,
             is_default: false,
             parent: entry.parent.clone(),
             log_file: None,

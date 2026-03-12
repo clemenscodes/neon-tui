@@ -18,11 +18,10 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let pid_header = if app.config.docker.mode { "Container" } else { "PID" };
     let header = Row::new(vec![
         Cell::from("Component"),
         Cell::from("Status"),
-        Cell::from(pid_header),
+        Cell::from("PID"),
         Cell::from("Port"),
         Cell::from("Uptime"),
     ])
@@ -49,16 +48,10 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 .map(|d| format_duration(d.as_secs()))
                 .unwrap_or_else(|| "-".to_string());
 
-            let pid = if app.config.docker.mode {
-                comp.docker_container
-                    .as_deref()
-                    .map(|name| short_container(name, &app.config.docker.compose_project))
-                    .unwrap_or_else(|| "-".to_string())
-            } else {
-                comp.pid
-                    .map(|p| p.to_string())
-                    .unwrap_or_else(|| "-".to_string())
-            };
+            let pid = comp
+                .pid
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "-".to_string());
 
             let row = Row::new(vec![
                 Cell::from(comp.name.clone()),
@@ -84,7 +77,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let widths = [
         ratatui::layout::Constraint::Length(24),
         ratatui::layout::Constraint::Length(10),
-        ratatui::layout::Constraint::Length(16),
+        ratatui::layout::Constraint::Length(8),
         ratatui::layout::Constraint::Length(8),
         ratatui::layout::Constraint::Min(8),
     ];
@@ -102,21 +95,6 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let mut state = TableState::default();
     state.select(Some(app.selected_index));
     f.render_stateful_widget(table, area, &mut state);
-}
-
-/// Strip the Compose project prefix and numeric index suffix from a container name.
-/// `eliteonlineshop-storage-broker-1` → `storage-broker`
-fn short_container(name: &str, project: &str) -> String {
-    let s = name
-        .strip_prefix(&format!("{project}-"))
-        .unwrap_or(name);
-    // Strip trailing -N index
-    if let Some(pos) = s.rfind('-') {
-        if s[pos + 1..].chars().all(|c| c.is_ascii_digit()) {
-            return s[..pos].to_string();
-        }
-    }
-    s.to_string()
 }
 
 fn format_duration(secs: u64) -> String {

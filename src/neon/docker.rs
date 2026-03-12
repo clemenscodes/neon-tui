@@ -117,6 +117,21 @@ pub fn list_containers(project: &str) -> Vec<DockerPs> {
     }
 }
 
+/// Get the host-level PID of the main process in a Docker container.
+pub fn container_pid(container_name: &str) -> Option<u32> {
+    let output = std::process::Command::new("docker")
+        .args(["inspect", "--format", "{{.State.Pid}}", container_name])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&output.stdout);
+    let pid: u32 = s.trim().parse().ok()?;
+    // Docker returns 0 if the container is not running.
+    if pid == 0 { None } else { Some(pid) }
+}
+
 /// Get the start time of a Docker container by running `docker inspect`.
 pub fn container_started_at(container_name: &str) -> Option<std::time::SystemTime> {
     let output = std::process::Command::new("docker")
