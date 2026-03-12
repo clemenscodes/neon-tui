@@ -380,7 +380,7 @@ fn map_panels_mode(key: KeyEvent, app: &mut App) -> Action {
         KeyCode::Char('x') => Action::StopSelected,
 
         KeyCode::Char('n') if app.panel == app::Panel::Branches => Action::NewBranch,
-        KeyCode::Char('d') if app.panel == app::Panel::Branches => Action::DeleteSelected,
+        KeyCode::Char('d') if app.panel == app::Panel::Branches || app.panel == app::Panel::Tenants => Action::DeleteSelected,
         KeyCode::Char('c') if app.panel == app::Panel::Branches => Action::CopyUrl,
         KeyCode::Char('p') if app.panel == app::Panel::Branches => Action::OpenPsql,
 

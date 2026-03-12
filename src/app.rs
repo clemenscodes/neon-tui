@@ -113,6 +113,7 @@ pub enum ConfirmAction {
     DeleteBranch(String),
     StopAll,
     DestroyNeon,
+    DeleteTimeline(String, String),
 }
 
 pub struct App {
@@ -466,6 +467,19 @@ impl App {
                                 async move { command::destroy(&config).await },
                             );
                         }
+                        ConfirmAction::DeleteTimeline(tenant_id, timeline_id) => {
+                            let config = self.config.clone();
+                            let short_id = timeline_id.chars().take(12).collect::<String>();
+                            self.spawn_bg(
+                                &format!("Deleting timeline {short_id}..."),
+                                format!("Timeline {short_id} deleted"),
+                                "Delete timeline failed".into(),
+                                async move {
+                                    command::delete_timeline(&config, &tenant_id, &timeline_id)
+                                        .await
+                                },
+                            );
+                        }
                     }
                 }
             }
@@ -531,6 +545,29 @@ impl App {
         }
     }
 
+    /// Returns `(tenant_id, timeline_id, is_root)` for the currently selected timeline
+    /// sub-row in the Tenants panel, or `None` if the selected row is a tenant header row
+    /// or a different panel is active.
+    pub fn selected_tenant_timeline(&self) -> Option<(String, String, bool)> {
+        if self.panel != Panel::Tenants {
+            return None;
+        }
+        let mut flat = 0usize;
+        for tenant in &self.state.tenants {
+            if flat == self.selected_index {
+                return None; // tenant header row
+            }
+            flat += 1;
+            for tl in &tenant.timelines {
+                if flat == self.selected_index {
+                    return Some((tenant.id.clone(), tl.id.clone(), tl.is_root));
+                }
+                flat += 1;
+            }
+        }
+        None
+    }
+
     fn delete_selected(&mut self) {
         if self.panel == Panel::Branches {
             if let Some(branch) = self.state.branches.get(self.selected_index) {
@@ -544,6 +581,25 @@ impl App {
                     action: Box::new(ConfirmAction::DeleteBranch(name)),
                 });
                 self.mode = Mode::Confirm;
+            }
+        } else if self.panel == Panel::Tenants {
+            match self.selected_tenant_timeline() {
+                None => {
+                    self.set_status("Select a non-root timeline sub-row to delete.");
+                }
+                Some((_, _, true)) => {
+                    self.set_status("Select a non-root timeline sub-row to delete.");
+                }
+                Some((tenant_id, timeline_id, false)) => {
+                    let short_id = timeline_id.chars().take(12).collect::<String>();
+                    self.pending_confirm = Some(PendingConfirm {
+                        message: format!(
+                            "Delete timeline {short_id}...? This removes pageserver data."
+                        ),
+                        action: Box::new(ConfirmAction::DeleteTimeline(tenant_id, timeline_id)),
+                    });
+                    self.mode = Mode::Confirm;
+                }
             }
         }
     }

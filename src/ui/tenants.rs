@@ -75,12 +75,15 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 Cell::from(tl.id.clone()),
             ]);
 
+            let is_dangling = tl.branch_name.is_none();
             let sub_row = if flat_index == app.selected_index {
                 sub_row.style(
                     Style::default()
                         .bg(Color::DarkGray)
                         .add_modifier(Modifier::BOLD),
                 )
+            } else if is_dangling {
+                sub_row.style(Style::default().fg(Color::Yellow))
             } else {
                 sub_row.style(Style::default().fg(Color::DarkGray))
             };
@@ -100,7 +103,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             Block::default()
                 .borders(Borders::ALL)
                 .title(" Tenants ")
-                .title_bottom(" Tenant management (read-only) "),
+                .title_bottom(" d delete timeline "),
         )
         .row_highlight_style(Style::default());
 

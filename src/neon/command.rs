@@ -1221,7 +1221,7 @@ async fn create_docker_branch(config: &Config, name: &str, parent: &str) -> Comm
 }
 
 /// Delete a branch in Docker mode: stop its compute container and remove state.
-async fn delete_docker_branch(_config: &Config, name: &str) -> CommandResult {
+async fn delete_docker_branch(config: &Config, name: &str) -> CommandResult {
     let mut state = docker::read_docker_branch_state();
     let entry = match state.branches.get(name) {
         Some(e) => e.clone(),
@@ -1240,12 +1240,68 @@ async fn delete_docker_branch(_config: &Config, name: &str) -> CommandResult {
             .await;
     }
 
+    let timeline_id = entry.timeline_id.clone();
     state.branches.remove(name);
     docker::save_docker_branch_state(&state);
 
+    // Also delete the timeline from the pageserver to avoid dangling timelines.
+    let mut warning = String::new();
+    if let Some(tenant_id) = get_default_tenant_id(config).await {
+        let result = delete_timeline(config, &tenant_id, &timeline_id).await;
+        if !result.success {
+            warning = format!(" (warning: pageserver timeline delete failed: {})", result.stderr);
+        }
+    }
+
     CommandResult::ok(format!(
-        "Branch '{name}' deleted. Timeline data is preserved in the pageserver."
+        "Branch '{name}' and its timeline deleted.{warning}"
     ))
+}
+
+/// Get the ID of the first (default) tenant from the pageserver HTTP API.
+pub async fn get_default_tenant_id(config: &Config) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct TenantEntry {
+        id: String,
+    }
+    let port = config.ports.pageserver_http;
+    let list: Vec<TenantEntry> = tokio::task::spawn_blocking(move || {
+        ureq::get(&format!("http://127.0.0.1:{port}/v1/tenant"))
+            .call()
+            .ok()
+            .and_then(|r| r.into_string().ok())
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default();
+    list.into_iter().next().map(|t| t.id)
+}
+
+/// Delete a timeline from the pageserver HTTP API.
+pub async fn delete_timeline(config: &Config, tenant_id: &str, timeline_id: &str) -> CommandResult {
+    let port = config.ports.pageserver_http;
+    let tenant_id = tenant_id.to_string();
+    let timeline_id = timeline_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        let url = format!(
+            "http://127.0.0.1:{port}/v1/tenant/{tenant_id}/timeline/{timeline_id}"
+        );
+        match ureq::delete(&url).call() {
+            Ok(_) => CommandResult::ok(format!("Timeline {timeline_id} deleted.")),
+            Err(ureq::Error::Status(status, response)) => {
+                let body = response.into_string().unwrap_or_default();
+                CommandResult::err(format!(
+                    "Pageserver returned HTTP {status} deleting timeline {timeline_id}: {body}"
+                ))
+            }
+            Err(e) => CommandResult::err(format!(
+                "Failed to delete timeline {timeline_id}: {e}"
+            )),
+        }
+    })
+    .await
+    .unwrap_or_else(|e| CommandResult::err(format!("spawn_blocking failed: {e}")))
 }
 
 /// Generate a random 32-char hex string for tenant/timeline IDs.

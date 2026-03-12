@@ -67,6 +67,7 @@ pub struct BranchInfo {
 pub struct TimelineInfo {
     pub id: String,
     pub branch_name: Option<String>,
+    pub is_root: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -222,6 +223,7 @@ fn build_docker_tenants(config: &Config) -> Vec<TenantInfo> {
                     TimelineInfo {
                         id: tl.timeline_id,
                         branch_name,
+                        is_root: tl.ancestor_timeline_id.is_none(),
                     }
                 })
                 .collect();
@@ -652,6 +654,7 @@ fn read_tenants(config: &Config) -> Vec<TenantInfo> {
                             .push(TimelineInfo {
                                 id: timeline_id,
                                 branch_name: Some(branch_name),
+                                is_root: false,
                             });
                     } else {
                         // timeline_id not parseable; still record tenant
