@@ -142,13 +142,65 @@ fn read_docker_state(config: &Config) -> NeonState {
     let components = build_docker_components(&containers, config);
     let branches = build_docker_branches(&containers, config);
 
+    let tenants = build_docker_tenants(config);
+
     NeonState {
         initialized,
         components,
         branches,
-        tenants: vec![],
+        tenants,
         last_refresh: SystemTime::now(),
     }
+}
+
+/// Fetch tenants from the pageserver HTTP API in Docker mode.
+///
+/// Queries `GET /v1/tenant` and then `GET /v1/tenant/{id}/timeline` for each tenant
+/// to obtain the timeline count.  Returns an empty Vec on any network / parse error.
+fn build_docker_tenants(config: &Config) -> Vec<TenantInfo> {
+    #[derive(Deserialize)]
+    struct TenantEntry {
+        id: String,
+    }
+
+    #[derive(Deserialize)]
+    struct TimelineEntry {
+        // We only need the list length; no fields required.
+    }
+
+    let base = format!("http://127.0.0.1:{}/v1", config.ports.pageserver_http);
+
+    // Fetch tenant list.
+    let tenant_list: Vec<TenantEntry> = match ureq::get(&format!("{base}/tenant"))
+        .call()
+        .ok()
+        .and_then(|r| r.into_string().ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+    {
+        Some(list) => list,
+        None => return vec![],
+    };
+
+    // There is typically one default tenant; treat the first as default.
+    let first_id = tenant_list.first().map(|t| t.id.clone());
+
+    tenant_list
+        .into_iter()
+        .map(|t| {
+            let timelines: Vec<TimelineEntry> =
+                ureq::get(&format!("{base}/tenant/{}/timeline", t.id))
+                    .call()
+                    .ok()
+                    .and_then(|r| r.into_string().ok())
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default();
+            TenantInfo {
+                is_default: first_id.as_deref() == Some(&t.id),
+                id: t.id,
+                timelines: timelines.len(),
+            }
+        })
+        .collect()
 }
 
 /// Map Docker Compose services to [`ComponentInfo`] entries shown in the Components panel.
