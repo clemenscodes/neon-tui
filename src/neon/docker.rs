@@ -24,7 +24,7 @@ pub struct DockerBranchState {
     pub branches: HashMap<String, DockerBranchEntry>,
 }
 
-const STATE_FILE: &str = ".neon-tui-docker-branches.json";
+pub const STATE_FILE: &str = ".neon-tui-docker-branches.json";
 
 pub fn read_docker_branch_state() -> DockerBranchState {
     let Ok(contents) = std::fs::read_to_string(STATE_FILE) else {

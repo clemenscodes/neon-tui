@@ -394,6 +394,39 @@ fn docker_unsupported(op: &str) -> CommandResult {
     ))
 }
 
+/// Stop a single Docker container by name (`docker stop`).
+async fn run_docker_stop(container: &str) -> CommandResult {
+    let out = tokio::process::Command::new("docker")
+        .args(["stop", container])
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => CommandResult::ok(format!("Stopped {container}.")),
+        Ok(o) => CommandResult::err(format!(
+            "Failed to stop {container}: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        Err(e) => CommandResult::err(format!("docker stop failed: {e}")),
+    }
+}
+
+/// Stop all branch containers tracked in the Docker state file.
+///
+/// Branch containers are started via `docker run` outside of Compose, so
+/// `docker compose stop/down` does not touch them.  This function ensures
+/// they are cleaned up before the Compose stack is stopped.
+async fn stop_branch_containers() {
+    let state = docker::read_docker_branch_state();
+    for (_name, entry) in &state.branches {
+        if let Some(container) = &entry.container {
+            let _ = tokio::process::Command::new("docker")
+                .args(["stop", container])
+                .output()
+                .await;
+        }
+    }
+}
+
 // ── Public API: Commands ─────────────────────────────────────────────────────
 
 /// Initialize Neon repository.
@@ -577,6 +610,8 @@ pub async fn start(config: &Config) -> CommandResult {
 /// Stop all Neon services.
 pub async fn stop(config: &Config) -> CommandResult {
     if config.docker.mode {
+        // Stop branch containers first (they're outside of Compose).
+        stop_branch_containers().await;
         return docker_compose(&config.docker.compose_project, &["stop"]).await;
     }
     let repo = &config.neon.repo_dir;
@@ -865,7 +900,18 @@ pub async fn start_endpoint(config: &Config, name: &str) -> CommandResult {
 /// Stop a branch endpoint.
 pub async fn stop_endpoint(config: &Config, name: &str) -> CommandResult {
     if config.docker.mode {
-        return docker_compose(&config.docker.compose_project, &["stop", name]).await;
+        if name == config.compute.default_branch {
+            // Default branch is a Compose service.
+            return docker_compose(&config.docker.compose_project, &["stop", "compute"]).await;
+        }
+        // Other branches are standalone containers tracked in the state file.
+        let state = docker::read_docker_branch_state();
+        if let Some(entry) = state.branches.get(name) {
+            if let Some(container) = &entry.container {
+                return run_docker_stop(container).await;
+            }
+        }
+        return CommandResult::err(format!("Branch '{name}' not found in Docker state."));
     }
     neon_local(config, &["endpoint", "stop", name]).await
 }
@@ -873,7 +919,17 @@ pub async fn stop_endpoint(config: &Config, name: &str) -> CommandResult {
 /// Destroy all Neon data.
 pub async fn destroy(config: &Config) -> CommandResult {
     if config.docker.mode {
-        return docker_unsupported("destroy");
+        // Stop and remove all branch containers (started outside Compose with --rm).
+        stop_branch_containers().await;
+        // Tear down the Compose stack and remove volumes.
+        let result = docker_compose(
+            &config.docker.compose_project,
+            &["down", "--volumes", "--remove-orphans"],
+        )
+        .await;
+        // Clear the local branch state file.
+        let _ = std::fs::remove_file(docker::STATE_FILE);
+        return result;
     }
     let repo = &config.neon.repo_dir;
     if !repo.is_dir() {
